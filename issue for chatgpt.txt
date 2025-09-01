@@ -1,0 +1,1766 @@
+import addOnSandboxSdk from "add-on-sdk-document-sandbox";
+import { editor } from "express-document-sdk";
+
+// Suppress console warnings from Adobe Express SDK - run this as early as possible
+(function() {
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    
+    // Override console methods immediately
+    console.warn = function(...args) {
+        const message = args.join(' ');
+        if (message.includes("Unsupported scenenode type 'chart:Chart'") ||
+            message.includes("Unsupported scenenode type") ||
+            message.includes("returning generic UnknownNode object") ||
+            message.includes("EventQueue overflow") ||
+            message.includes("dropping log event below error level") ||
+            message.includes('iframe') || 
+            message.includes('sandbox') || 
+            message.includes('dev mode') ||
+            message.includes('production') ||
+            message.includes('EndPerfActionError') ||
+            message.includes('Spectrum Web Components') ||
+            message.includes('Lit is in dev mode')) {
+            return; // Suppress these warnings
+        }
+        // Allow other warnings through
+        originalWarn.apply(console, args);
+    };
+    
+    console.error = function(...args) {
+        const message = args.join(' ');
+        if (message.includes("Unsupported scenenode type 'chart:Chart'") ||
+            message.includes("Unsupported scenenode type") ||
+            message.includes("returning generic UnknownNode object") ||
+            message.includes("EventQueue overflow") ||
+            message.includes("dropping log event below error level") ||
+            message.includes('iframe') || 
+            message.includes('sandbox') || 
+            message.includes('EndPerfActionError')) {
+            return; // Suppress these errors
+        }
+        // Allow other errors through
+        originalError.apply(console, args);
+    };
+    
+    // Also override at global level
+    if (typeof window !== 'undefined') {
+        window.console = window.console || console;
+        window.console.warn = console.warn;
+        window.console.error = console.error;
+    }
+    
+    // Try to override at the browser dev tools level
+    try {
+        if (typeof window !== 'undefined' && window.parent && window.parent.console) {
+            window.parent.console.warn = console.warn;
+            window.parent.console.error = console.error;
+        }
+    } catch (e) {
+        // Silent fail - cross-origin restrictions
+    }
+})();
+
+// Get the document sandbox runtime.
+const { runtime } = addOnSandboxSdk.instance;
+
+// Note: Visibility is now handled by setting opacity to 0 and locking the node
+// No need to cache hidden nodes anymore
+
+// Helper function to run operations within editor context
+async function runEdit(operationName, operation) {
+    try {
+        // Try different approaches for running edits
+        if (typeof editor.edit === "function") {
+            // Use editor.edit if available
+            return await editor.edit(operation);
+        } else if (typeof editor.transaction === "function") {
+            // Use editor.transaction if available
+            return await editor.transaction(operation);
+        } else {
+            // Fallback: just run the operation directly
+            return operation();
+        }
+    } catch (error) {
+        throw error;
+    }
+}
+
+// Helper – breadth-first search for a node by id in the current document tree
+function findNodeById(nodeId) {
+    if (!editor || !editor.documentRoot) return null;
+    const queue = [editor.documentRoot];
+    while (queue.length) {
+        const current = queue.shift();
+        if (current.id === nodeId) return current;
+        
+        // CRITICAL: Skip table nodes to prevent stack overflow
+        if (current.editorName === "tables" || current.type === "table") {
+            continue; // Don't process children of tables
+        }
+        
+        // Safe children processing
+        if (current.children && typeof current.children[Symbol.iterator] === "function") {
+            try {
+                for (const child of current.children) {
+                    queue.push(child);
+                }
+            } catch (err) {
+                console.warn("Skipping children of node in findNodeById:", current.id, err);
+            }
+        } else if (current.pages) {
+            try {
+                for (const page of current.pages) {
+                    queue.push(page);
+                }
+            } catch (err) {
+                console.warn("Skipping pages of node in findNodeById:", current.id, err);
+            }
+        } else if (current.artboards) {
+            try {
+                for (const artboard of current.artboards) {
+                    queue.push(artboard);
+                }
+            } catch (err) {
+                console.warn("Skipping artboards of node in findNodeById:", current.id, err);
+            }
+        }
+    }
+    return null;
+}
+
+// Helper – get current selection using multiple methods
+function getCurrentSelection() {
+    const selectedIds = new Set();
+    
+    // Method 1: Try editor.selection.items
+    try {
+        if (editor.selection && editor.selection.items && editor.selection.items.length > 0) {
+            editor.selection.items.forEach(item => selectedIds.add(item.id));
+            return selectedIds;
+        }
+    } catch (error) {
+        // Silent fail
+    }
+    
+    // Method 2: Try editor.selection.selectedItems (alternative property name)
+    try {
+        if (editor.selection && editor.selection.selectedItems && editor.selection.selectedItems.length > 0) {
+            editor.selection.selectedItems.forEach(item => selectedIds.add(item.id));
+            return selectedIds;
+        }
+    } catch (error) {
+        // Silent fail
+    }
+    
+    // Method 3: Try editor.selection.getSelectedItems() (method call)
+    try {
+        if (editor.selection && typeof editor.selection.getSelectedItems === 'function') {
+            const items = editor.selection.getSelectedItems();
+            if (items && items.length > 0) {
+                items.forEach(item => selectedIds.add(item.id));
+                return selectedIds;
+            }
+        }
+    } catch (error) {
+        // Silent fail
+    }
+    
+    // Method 4: Try editor.getSelectedItems() (top-level method)
+    try {
+        if (typeof editor.getSelectedItems === 'function') {
+            const items = editor.getSelectedItems();
+            if (items && items.length > 0) {
+                items.forEach(item => selectedIds.add(item.id));
+                return selectedIds;
+            }
+        }
+    } catch (error) {
+        // Silent fail
+    }
+    
+    // Method 5: NEW - Try to detect selection by checking node properties
+    try {
+        const allNodes = [];
+        const queue = [editor.documentRoot];
+        
+        // Collect all nodes
+        while (queue.length > 0) {
+            const current = queue.shift();
+            if (current && current.id) {
+                allNodes.push(current);
+            }
+            
+            // CRITICAL: Skip table nodes to prevent stack overflow
+            if (current.editorName === "tables" || current.type === "table") {
+                continue; // Don't process children of tables
+            }
+            
+            // Safe children processing
+            if (current.children && typeof current.children[Symbol.iterator] === "function") {
+                try {
+                    for (const child of current.children) {
+                        queue.push(child);
+                    }
+                } catch (err) {
+                    console.warn("Skipping children of node in getCurrentSelection:", current.id, err);
+                }
+            } else if (current.pages) {
+                try {
+                    for (const page of current.pages) {
+                        queue.push(page);
+                    }
+                } catch (err) {
+                    console.warn("Skipping pages of node in getCurrentSelection:", current.id, err);
+                }
+            } else if (current.artboards) {
+                try {
+                    for (const artboard of current.artboards) {
+                        queue.push(artboard);
+                    }
+                } catch (err) {
+                    console.warn("Skipping artboards of node in getCurrentSelection:", current.id, err);
+                }
+            }
+        }
+        
+        // Check each node for selection-related properties
+        for (const node of allNodes) {
+            try {
+                // Check if node has a 'selected' property
+                if (node.selected === true) {
+                    selectedIds.add(node.id);
+                }
+                
+                // Check if node has an 'isSelected' property
+                if (node.isSelected === true) {
+                    selectedIds.add(node.id);
+                }
+                
+                // Check if node has a 'selectionState' property
+                if (node.selectionState === 'selected' || node.selectionState === true) {
+                    selectedIds.add(node.id);
+                }
+                
+                // Check if node has a 'highlighted' property
+                if (node.highlighted === true) {
+                    selectedIds.add(node.id);
+                }
+                
+            } catch (err) {
+                // Ignore errors for individual nodes
+            }
+        }
+        
+        if (selectedIds.size > 0) {
+            return selectedIds;
+        }
+        
+    } catch (error) {
+        // Silent fail
+    }
+    
+    // Method 6: NEW - Try to use editor.context or other context properties
+    try {
+        if (editor.context) {
+            // Check for selection in context
+            if (editor.context.selection && Array.isArray(editor.context.selection)) {
+                editor.context.selection.forEach(item => {
+                    selectedIds.add(item.id);
+                });
+            }
+            
+            // Check for selectedItems in context
+            if (editor.context.selectedItems && Array.isArray(editor.context.selectedItems)) {
+                editor.context.selectedItems.forEach(item => {
+                    selectedIds.add(item.id);
+                });
+            }
+            
+            // Check for activeSelection in context
+            if (editor.context.activeSelection && Array.isArray(editor.context.activeSelection)) {
+                editor.context.activeSelection.forEach(item => {
+                    selectedIds.add(item.id);
+                });
+            }
+        }
+        
+        if (selectedIds.size > 0) {
+            return selectedIds;
+        }
+        
+    } catch (error) {
+        // Silent fail
+    }
+    
+    return selectedIds;
+}
+
+function start() {
+    // APIs to be exposed to the UI runtime
+    // i.e., to the `index.html` file of this add-on.
+    const sandboxApi = {
+        // Get all layers from the current Adobe Express document
+        getFrames: async () => {
+            try {
+                const frames = [];
+                let frameCounter = 1;
+                
+                // DEBUG: Log current selection to understand table structure
+                try {
+                    if (editor.selection && editor.selection.items && editor.selection.items.length > 0) {
+                        console.log("=== SELECTION DEBUG ===");
+                        console.log("Selected item:", editor.selection.items[0]);
+                        console.log("Selected item type:", editor.selection.items[0].type);
+                        console.log("Selected item name:", editor.selection.items[0].name);
+                        console.log("Selected item editorName:", editor.selection.items[0].editorName);
+                        
+                        if (editor.selection.items[0].children) {
+                            console.log("Selected item children count:", editor.selection.items[0].children.length);
+                            // Don't try to convert children to array for tables
+                            if (editor.selection.items[0].editorName !== "tables" && editor.selection.items[0].type !== "table") {
+                                try {
+                                    console.log("First few children:", Array.from(editor.selection.items[0].children).slice(0, 3));
+                                } catch (err) {
+                                    console.log("Cannot access children (likely a table):", err.message);
+                                }
+                            } else {
+                                console.log("Skipping children access for table node");
+                            }
+                        }
+                        console.log("=== END SELECTION DEBUG ===");
+                    }
+                } catch (debugError) {
+                    console.warn("Debug logging failed:", debugError);
+                }
+
+                // Track visited nodes to prevent infinite loops
+                const visitedNodes = new Set();
+                
+                // Safe function to extract node info without touching children
+                const safeNodeInfo = (node) => {
+                    return {
+                        id: node.id,
+                        name: node.name,
+                        type: node.type,
+                        editorName: node.editorName
+                    };
+                };
+
+                // Helper function to collect frames from a node
+                const collectFramesFromNode = async (node, depth = 0, pageInfo = null) => {
+                    try {
+                        // Safety check to prevent infinite loops
+                        if (depth > 20) {
+                            console.warn("Maximum depth reached, stopping traversal to prevent infinite loop");
+                            return;
+                        }
+                        
+                        // Check if we've already visited this node
+                        if (visitedNodes.has(node.id)) {
+                            console.warn("Circular reference detected, skipping node:", node.id);
+                            return;
+                        }
+                        
+                        // Mark this node as visited
+                        visitedNodes.add(node.id);
+                        
+                        // Track page information
+                        let currentPageInfo = pageInfo;
+                        if (node.type === "page" || node.type === "Page") {
+                            currentPageInfo = {
+                                pageId: node.id,
+                                pageName: node.name || `Page ${node.id}`
+                            };
+                        }
+
+                        // Skip certain container types that don't represent actual layers
+                        const ignoredContainer = (t) => {
+                            return t === "document" || 
+                                   t === "page" || 
+                                   t === "artboard" || 
+                                   t === "ArtworkRoot" ||
+                                   t === "ab:Artboard" ||
+                                   t === "Page";
+                        };
+
+                        // CRITICAL: Check for tables BEFORE doing anything else
+                        if (node.editorName === "tables" || node.type === "table") {
+                            console.log("Table node detected, adding as single layer:", node.type, node.name);
+                            
+                            // Add table as a single layer without touching children
+                            if (node && node.type && !ignoredContainer(node.type)) {
+                                frames.push({
+                                    id: `frame-${frameCounter++}`,
+                                    name: node.name || "Table",
+                                    nodeId: node.id,
+                                    type: "Table", // Mark as Table type
+                                    checked: false,
+                                    depth: depth,
+                                    pageId: currentPageInfo?.pageId || null,
+                                    pageName: currentPageInfo?.pageName || null,
+                                    visible: true, // Assume visible for tables
+                                    locked: false, // Assume unlocked for tables
+                                    thumbnail: null
+                                });
+                            }
+                            return; // Don't touch children at all
+                        }
+
+                        if (node && node.type && !ignoredContainer(node.type)) {
+                            // Thumbnail generation disabled - use placeholder
+                            let thumbnail = null;
+                            
+                            // Try to get a proper name for the node
+                            let nodeName = node.name;
+                            if (!nodeName || nodeName === "undefined") {
+                                // Try alternative name properties
+                                if (node.title) nodeName = node.title;
+                                else if (node.label) nodeName = node.label;
+                                else if (node.caption) nodeName = node.caption;
+                                else nodeName = `${node.type} ${frameCounter}`;
+                            }
+                            
+                            frames.push({
+                                id: `frame-${frameCounter++}`,
+                                name: nodeName,
+                                nodeId: node.id,
+                                type: node.type,
+                                checked: false, // Will be updated below
+                                depth: depth,
+                                pageId: currentPageInfo?.pageId || null,
+                                pageName: currentPageInfo?.pageName || null,
+                                visible: (() => {
+                                    // Check if node is hidden based on opacity only (not lock status)
+                                    if (typeof node.opacity === "number" && node.opacity === 0) {
+                                        return false;
+                                    }
+                                    
+                                    // Fallback: check fill and stroke opacity
+                                    if (typeof node.opacity === "undefined") {
+                                        if (node.fill && typeof node.fill.opacity === "number" && node.fill.opacity === 0) {
+                                            return false;
+                                        }
+                                        if (node.stroke && typeof node.stroke.opacity === "number" && node.stroke.opacity === 0) {
+                                            return false;
+                                        }
+                                    }
+                                    
+                                    return true;
+                                })(),
+                                locked: node.locked === true,
+                                thumbnail: thumbnail
+                            });
+                        }
+
+                        // Traverse children (with safety checks) - ONLY for non-table nodes
+                        if (node.children && typeof node.children[Symbol.iterator] === "function") {
+                            try {
+                                for (const child of node.children) {
+                                    // CRITICAL: Check for tables BEFORE processing child
+                                    if (child.editorName === "tables" || child.type === "table") {
+                                        console.log("Skipped table child:", child.type, child.name);
+                                        continue;
+                                    }
+                                    
+                                    // Additional safety check
+                                    if (child && child.id && !visitedNodes.has(child.id)) {
+                                        await collectFramesFromNode(child, depth + 1, currentPageInfo);
+                                    }
+                                }
+                            } catch (childError) {
+                                console.warn("Error processing children, skipping node:", node.id, childError);
+                                // Continue with other nodes instead of stopping
+                            }
+                        } else if (node.pages && typeof node.pages[Symbol.iterator] === "function") {
+                            try {
+                                for (const page of node.pages) {
+                                    await collectFramesFromNode(page, depth + 1, currentPageInfo);
+                                }
+                            } catch (pageError) {
+                                console.warn("Error processing pages:", pageError);
+                            }
+                        } else if (node.artboards && typeof node.artboards[Symbol.iterator] === "function") {
+                            try {
+                                // PageNode exposes artboards collection
+                                for (const artboard of node.artboards) {
+                                    await collectFramesFromNode(artboard, depth + 1, currentPageInfo);
+                                }
+                            } catch (artboardError) {
+                                console.warn("Error processing artboards:", artboardError);
+                            }
+                        }
+                    } catch (err) {
+                        console.warn("Error in collectFramesFromNode:", err);
+                    }
+                };
+
+                /* Start traversal from the Document Root */
+                const documentRoot = editor.documentRoot;
+                if (documentRoot) {
+                    await collectFramesFromNode(documentRoot, 0, null);
+                }
+
+                /****************** END traversal ********************/
+
+                // NEW APPROACH: Use improved selection detection
+                const currentSelection = getCurrentSelection();
+                
+                // Update checked status based on detected selection
+                for (const f of frames) {
+                    f.checked = currentSelection.has(f.nodeId);
+                }
+                
+                // Try to get all visible elements
+                try {
+                    // This is a workaround to try to access all visible elements
+                    const allElements = [];
+                    
+                    // Try to use the selection to find more elements
+                    if (editor.selection && typeof editor.selection.selectAll === 'function') {
+                        try {
+                            // Save current selection
+                            const currentSelection = editor.selection.items ? [...editor.selection.items] : [];
+                            
+                            // Select all elements
+                            editor.selection.selectAll();
+                            
+                            // Get the selected elements
+                            if (editor.selection.items && editor.selection.items.length > 0) {
+                                for (let i = 0; i < editor.selection.items.length; i++) {
+                                    allElements.push(editor.selection.items[i]);
+                                }
+                            }
+                            
+                            // Restore original selection
+                            editor.selection.clear();
+                            if (currentSelection.length > 0) {
+                                for (const item of currentSelection) {
+                                    editor.selection.add(item);
+                                }
+                            }
+                        } catch (selectErr) {
+                            // Silent error handling
+                        }
+                    }
+                } catch (err) {
+                    // Silent error handling
+                }
+                
+                // Remove duplicates and sort
+                const uniqueFrames = frames.filter((frame, index, self) => 
+                    index === self.findIndex(f => f.nodeId === frame.nodeId)
+                );
+                
+                return { success: true, frames: uniqueFrames };
+            } catch (error) {
+                return { 
+                    success: false, 
+                    error: error.message,
+                    stack: error.stack
+                };
+            }
+        },
+
+        // NEW: Get existing groups from the document
+        getExistingGroups: async () => {
+            try {
+                // Only log in development mode
+                const isDev = true; // Set to false in production
+                if (isDev) {
+            
+            
+            
+                }
+                
+                // First, try to get groups from getFrames to see what's available
+                try {
+                    const framesResult = await sandboxApi.getFrames();
+                    if (framesResult.success && framesResult.frames) {
+                
+                        const groupFrames = framesResult.frames.filter(f => 
+                            f.type && f.type.toLowerCase().includes('group')
+                        );
+                
+                    }
+                } catch (frameError) {
+            
+                }
+                
+                const groups = [];
+                let groupCounter = 1;
+
+                // Helper function to collect groups from a node
+                const collectGroupsFromNode = async (node, depth = 0) => {
+                    try {
+                
+                        
+                        // Check if this is a group node - try multiple approaches
+                        const isGroupNode = (node && (
+                            node.type === "group" || 
+                            node.type === "Group" || 
+                            node.type === "GROUP" ||
+                            (typeof node.type === "string" && node.type.toLowerCase().includes("group")) ||
+                            (node.children && node.children.length > 0 && node.type !== "Text" && node.type !== "MediaContainer" && node.type !== "ab:Artboard" && node.type !== "Page" && node.type !== "ArtworkRoot")
+                        ));
+                        
+                        if (isGroupNode) {
+                
+                
+                
+                
+                
+                            
+                            // Get all children of this group
+                            const groupChildren = [];
+                            if (node.children && typeof node.children[Symbol.iterator] === "function") {
+                                try {
+                                    for (const child of node.children) {
+                                        // Skip nested groups for now
+                                        if (child.type !== "group") {
+                                            // Skip table children
+                                            if (child.editorName === "tables" || child.type === "table") {
+                                                continue;
+                                            }
+                                            
+                                            groupChildren.push({
+                                                id: `frame-${groupCounter++}`,
+                                                name: child.name || `${child.type} ${groupCounter}`,
+                                                nodeId: child.id,
+                                                type: child.type,
+                                                checked: false,
+                                                depth: depth + 1,
+                                                visible: (() => {
+                                                    if (typeof child.opacity === "number" && child.opacity === 0) {
+                                                        return false;
+                                                    }
+                                                    return true;
+                                                })(),
+                                                locked: child.locked === true,
+                                                thumbnail: null
+                                            });
+                                        }
+                                    }
+                                } catch (err) {
+                                    console.warn("Error processing group children:", err);
+                                }
+                            }
+
+                            groups.push({
+                                id: `group-${groupCounter++}`,
+                                name: node.name || `Group ${groupCounter}`,
+                                nodeId: node.id,
+                                type: "group",
+                                children: groupChildren,
+                                checked: false,
+                                depth: depth,
+                                visible: true,
+                                locked: false
+                            });
+                            
+                    
+                        }
+
+                        // Traverse children
+                        if (node.children && typeof node.children[Symbol.iterator] === "function") {
+                            try {
+                                for (const child of node.children) {
+                                    // Skip table children
+                                    if (child.editorName === "tables" || child.type === "table") {
+                                        continue;
+                                    }
+                                    await collectGroupsFromNode(child, depth + 1);
+                                }
+                            } catch (err) {
+                                console.warn("Error processing children in collectGroupsFromNode:", err);
+                            }
+                        } else if (node.pages && typeof node.pages[Symbol.iterator] === "function") {
+                            try {
+                                for (const page of node.pages) {
+                                    await collectGroupsFromNode(page, depth + 1);
+                                }
+                            } catch (err) {
+                                console.warn("Error processing pages in collectGroupsFromNode:", err);
+                            }
+                        } else if (node.artboards && typeof node.artboards[Symbol.iterator] === "function") {
+                            try {
+                                for (const artboard of node.artboards) {
+                                    await collectGroupsFromNode(artboard, depth + 1);
+                                }
+                            } catch (err) {
+                                console.warn("Error processing artboards in collectGroupsFromNode:", err);
+                            }
+                        }
+                    } catch (err) {
+            
+                    }
+                };
+
+                // Start traversal from the Document Root
+                const documentRoot = editor.documentRoot;
+                if (documentRoot) {
+            
+                    await collectGroupsFromNode(documentRoot, 0);
+                } else {
+            
+                }
+                
+                // Also try to find groups using alternative methods
+                try {
+                    // Method 1: Check if editor has a groups property
+                    if (editor.groups) {
+                
+                    }
+                    
+                    // Method 2: Check if editor has a getGroups method
+                    if (typeof editor.getGroups === 'function') {
+                        const editorGroups = await editor.getGroups();
+                
+                    }
+                    
+                    // Method 3: Check if editor has a getAllGroups method
+                    if (typeof editor.getAllGroups === 'function') {
+                        const allGroups = await editor.getAllGroups();
+                
+                    }
+                    
+                    // Method 4: Check if editor.context has groups
+                    if (editor.context && editor.context.groups) {
+                
+                    }
+                    
+                } catch (altError) {
+            
+                }
+
+        
+                return { success: true, groups: groups };
+            } catch (err) {
+    
+                return { success: false, error: err.message };
+            }
+        },
+        
+        // NEW: Toggle layer visibility on/off - using opacity and lock instead of caching
+        toggleVisibility: async (nodeId, forceVisible = null) => {
+            try {
+                // Find node in current document
+                const node = findNodeById(nodeId);
+                if (!node) return { success: false, error: "Node not found" };
+
+                // If forceVisible is specified, use that value
+                if (forceVisible !== null) {
+                    const newVisible = forceVisible;
+                    
+                    if (newVisible) {
+                        // Show: restore opacity only (don't change lock status)
+                        if (typeof node.opacity === "number") {
+                            node.opacity = 1;
+                        }
+                        
+                        // Fallback: if opacity is not available, try alternative methods
+                        if (typeof node.opacity === "undefined") {
+                            if (node.fill && typeof node.fill.opacity === "number") {
+                                node.fill.opacity = 1;
+                            }
+                            if (node.stroke && typeof node.stroke.opacity === "number") {
+                                node.stroke.opacity = 1;
+                            }
+                        }
+                    } else {
+                        // Hide: set opacity to 0 only (don't change lock status)
+                        if (typeof node.opacity === "number") {
+                            node.opacity = 0;
+                        }
+                        
+                        // Fallback: if opacity is not available, try alternative methods
+                        if (typeof node.opacity === "undefined") {
+                            if (node.fill && typeof node.fill.opacity === "number") {
+                                node.fill.opacity = 0;
+                            }
+                            if (node.stroke && typeof node.stroke.opacity === "number") {
+                                node.stroke.opacity = 0;
+                            }
+                        }
+                    }
+                    
+                    return { success: true, visible: newVisible };
+                }
+
+                // Toggle based on current state
+                // Check if node is currently hidden (opacity 0 only)
+                const isCurrentlyHidden = (node.opacity === 0);
+                
+                if (isCurrentlyHidden) {
+                    // Show: restore opacity only (don't change lock status)
+                    if (typeof node.opacity === "number") {
+                        node.opacity = 1;
+                    }
+                    
+                    // Fallback: if opacity is not available, try alternative methods
+                    if (typeof node.opacity === "undefined") {
+                        // Try to use fill opacity if available
+                        if (node.fill && typeof node.fill.opacity === "number") {
+                            node.fill.opacity = 1;
+                        }
+                        // Try to use stroke opacity if available
+                        if (node.stroke && typeof node.stroke.opacity === "number") {
+                            node.stroke.opacity = 1;
+                        }
+                    }
+                    
+                    return { success: true, visible: true };
+                } else {
+                    // Hide: set opacity to 0 only (don't change lock status)
+                    if (typeof node.opacity === "number") {
+                        node.opacity = 0;
+                    }
+                    
+                    // Fallback: if opacity is not available, try alternative methods
+                    if (typeof node.opacity === "undefined") {
+                        // Try to use fill opacity if available
+                        if (node.fill && typeof node.fill.opacity === "number") {
+                            node.fill.opacity = 0;
+                        }
+                        // Try to use stroke opacity if available
+                        if (node.stroke && typeof node.stroke.opacity === "number") {
+                            node.stroke.opacity = 0;
+                        }
+                    }
+                    
+                    return { success: true, visible: false };
+                }
+            } catch (err) {
+                return { success: false, error: err.message };
+            }
+        },
+        
+        // NEW: Toggle layer lock/unlock
+        toggleLock: async (nodeId, forceLocked = null) => {
+            try {
+                // Find node in current document
+                const node = findNodeById(nodeId);
+                if (!node) return { success: false, error: "Node not found" };
+                
+                const newLocked = forceLocked !== null ? forceLocked : !node.locked;
+                
+                // Only change the locked property, don't touch opacity or visibility
+                if (typeof node.locked === "boolean") {
+                    node.locked = newLocked;
+                }
+                
+                return { success: true, locked: newLocked };
+            } catch (err) {
+                return { success: false, error: err.message };
+            }
+        },
+
+        // NEW: Rename a layer
+        renameLayer: async (nodeId, newName) => {
+            try {
+                if (!newName) return { success: false, error: "Missing newName" };
+                let node = null;
+                if (editor.selection && editor.selection.items) {
+                    node = editor.selection.items.find(item => item.id === nodeId);
+                }
+                if (!node && editor.documentRoot) {
+                    const queue = [editor.documentRoot];
+                    while (queue.length && !node) {
+                        const current = queue.shift();
+                        if (current.id === nodeId) {
+                            node = current;
+                            break;
+                        }
+                        if (current.children) {
+                            queue.push(...Array.from(current.children));
+                        } else if (current.pages) {
+                            queue.push(...Array.from(current.pages));
+                        } else if (current.artboards) {
+                            queue.push(...Array.from(current.artboards));
+                        }
+                    }
+                }
+                if (!node) return { success: false, error: "Node not found" };
+
+                await runEdit("Rename Layer", () => {
+                    if (typeof node.rename === "function") {
+                        node.rename(newName);
+                    } else {
+                        node.name = newName;
+                    }
+                });
+                return { success: true };
+            } catch (err) {
+                return { success: false, error: err.message };
+            }
+        },
+
+        // NEW: Group selected layers together under a new group node
+        groupLayers: async (selectedNodeIds, groupName = "Group") => {
+            try {
+                if (!Array.isArray(selectedNodeIds) || selectedNodeIds.length < 2) {
+                    return { success: false, error: "Need at least two nodeIds to group" };
+                }
+                // Resolve nodes
+                const nodes = [];
+                const queue = [editor.documentRoot];
+                while (queue.length && nodes.length < selectedNodeIds.length) {
+                    const current = queue.shift();
+                    if (selectedNodeIds.includes(current.id)) {
+                        nodes.push(current);
+                    }
+                    if (current.children) queue.push(...Array.from(current.children));
+                    else if (current.pages) queue.push(...Array.from(current.pages));
+                    else if (current.artboards) queue.push(...Array.from(current.artboards));
+                }
+                if (nodes.length < 2) return { success: false, error: "Could not resolve all nodes" };
+                let groupNode = null;
+                if (typeof editor.group === "function") {
+                    groupNode = await editor.group(nodes);
+                } else if (typeof editor.createGroup === "function") {
+                    groupNode = editor.createGroup();
+                    groupNode.name = groupName;
+                    const parent = nodes[0].parent || (editor.context && editor.context.insertionParent);
+                    if (parent && parent.children && typeof parent.children.append === "function") {
+                        parent.children.append(groupNode);
+                    }
+                    // Move nodes into group
+                    for (const n of nodes) {
+                        if (n.parent && typeof n.moveAbove === "function") {
+                            await n.moveAbove(groupNode); // ensures same parent
+                        }
+                        if (groupNode.children && typeof groupNode.children.append === "function") {
+                            groupNode.children.append(n);
+                        }
+                    }
+                } else {
+                    return { success: false, error: "Grouping not supported in this environment" };
+                }
+                if (groupNode) {
+                    if (groupName) groupNode.name = groupName;
+                    return { success: true, groupId: groupNode.id };
+                }
+                return { success: false, error: "Unknown error grouping" };
+            } catch (err) {
+                return { success: false, error: err.message };
+            }
+        },
+
+
+
+        // NEW: Ungroup a group node – moves its children to parent then deletes group
+        ungroupLayer: async (groupNodeId) => {
+            try {
+                if (!groupNodeId) return { success: false, error: "Missing groupNodeId" };
+                
+                return await runEdit("Ungroup Layer", async () => {
+                    // Use the improved findNodeById function that searches all node types
+                    const groupNode = findNodeById(groupNodeId);
+                    if (!groupNode) {
+                
+                        
+                        // Try to find by name as fallback
+                        const allFrames = await sandboxApi.getFrames();
+                        const frameByName = allFrames.frames?.find(f => f.name === groupNodeId || f.nodeId === groupNodeId);
+                        if (frameByName) {
+                    
+                            return await sandboxApi.ungroupLayer(frameByName.nodeId);
+                        }
+                        
+                        return { success: false, error: "Group node not found" };
+                    }
+                    
+            
+                    
+                    const parent = groupNode.parent;
+                    if (!parent || !parent.children) {
+                        throw new Error("Cannot ungroup root");
+                    }
+                    
+                    // Move children out
+                    const kids = Array.from(groupNode.children || []);
+            
+                    
+                    for (const kid of kids) {
+                        try {
+                            if (typeof kid.moveAbove === "function") {
+                                await kid.moveAbove(groupNode);
+                            } else if (parent.children && typeof parent.children.append === "function") {
+                                // Alternative: move to parent
+                                parent.children.append(kid);
+                            }
+                        } catch (moveErr) {
+                    
+                        }
+                    }
+                    
+                    // Remove the group
+                    try {
+                        if (typeof groupNode.remove === "function") {
+                            await groupNode.remove();
+                        } else if (typeof groupNode.removeFromParent === "function") {
+                            await groupNode.removeFromParent();
+                        } else if (parent.children && typeof parent.children.remove === "function") {
+                            parent.children.remove(groupNode);
+                        } else {
+                    
+                        }
+                    } catch (removeErr) {
+                
+                    }
+                    
+                    return { success: true };
+                });
+                    } catch (err) {
+            return { success: false, error: err.message };
+        }
+        },
+
+        // NEW: Delete a layer
+        deleteLayer: async (nodeId) => {
+            try {
+                const node = findNodeById(nodeId);
+                if (!node) {
+                    return { success: false, error: "Node not found" };
+                }
+
+                await runEdit("Delete Layer", () => {
+                    if (typeof node.remove === "function") {
+                        node.remove();
+                    } else if (node.parent && typeof node.parent.children.remove === "function") {
+                        node.parent.children.remove(node);
+                    } else {
+                        throw new Error("Cannot delete this layer");
+                    }
+                });
+
+                return { success: true };
+            } catch (err) {
+                return { success: false, error: err.message };
+            }
+        },
+
+        // NEW: Move layer up in z-order (bring forward) using remove/insert
+        moveLayerUp: async (nodeId) => {
+            try {
+                const node = findNodeById(nodeId);
+                if (!node) {
+                    return { success: false, error: "Node not found" };
+                }
+
+                const parent = node.parent;
+                if (!parent || !parent.children) {
+                    return { success: false, error: "No parent container" };
+                }
+
+                await runEdit("Move Layer Up", () => {
+                    const siblings = Array.from(parent.children);
+                    const currentIndex = siblings.findIndex(s => s.id === nodeId);
+                    
+                    if (currentIndex >= siblings.length - 1) {
+                        return;
+                    }
+
+                    // Remove node first
+                    if (typeof node.removeFromParent === "function") {
+                        node.removeFromParent();
+                    } else {
+                        throw new Error("removeFromParent not supported");
+                    }
+
+                    // Get siblings again after removal
+                    const newSiblings = Array.from(parent.children);
+                    
+                    // Since we reversed the order, moving UP means INCREASING index
+                    const newIndex = Math.min(newSiblings.length, currentIndex + 1);
+
+                    // Try different insert methods
+                    if (typeof parent.children.insertAt === "function") {
+                        parent.children.insertAt(node, newIndex);
+                    } else if (typeof parent.children.insert === "function") {
+                        parent.children.insert(node, newIndex);
+                    } else {
+                        // Better fallback: always append (which puts it at the back)
+                        parent.children.append(node);
+                    }
+                });
+
+                return { success: true };
+            } catch (err) {
+                return { success: false, error: err.message };
+            }
+        },
+
+        // NEW: Move layer down in z-order (send backward) using remove/insert
+        moveLayerDown: async (nodeId) => {
+            try {
+                const node = findNodeById(nodeId);
+                if (!node) {
+                    return { success: false, error: "Node not found" };
+                }
+
+                const parent = node.parent;
+                if (!parent || !parent.children) {
+                    return { success: false, error: "No parent container" };
+                }
+
+                await runEdit("Move Layer Down", () => {
+                    const siblings = Array.from(parent.children);
+                    const currentIndex = siblings.findIndex(s => s.id === nodeId);
+                    
+                    if (currentIndex <= 0) {
+                        return;
+                    }
+
+                    // Remove node first
+                    if (typeof node.removeFromParent === "function") {
+                        node.removeFromParent();
+                    } else {
+                        throw new Error("removeFromParent not supported");
+                    }
+
+                    // Get siblings again after removal
+                    const newSiblings = Array.from(parent.children);
+                    
+                    // Since we reversed the order, moving DOWN means DECREASING index
+                    const newIndex = Math.max(0, currentIndex - 1);
+
+                    // Try different insert methods
+                    if (typeof parent.children.insertAt === "function") {
+                        parent.children.insertAt(node, newIndex);
+                    } else if (typeof parent.children.insert === "function") {
+                        parent.children.insert(node, newIndex);
+                    } else {
+                        // Better fallback: insert at front using prepend
+                        if (newIndex === 0 && typeof parent.children.prepend === "function") {
+                            parent.children.prepend(node);
+                        } else {
+                            parent.children.append(node);
+                        }
+                    }
+                });
+
+                return { success: true };
+            } catch (err) {
+                return { success: false, error: err.message };
+            }
+        },
+
+        // NEW: Optimized folder-aware layer movement
+        moveToFolder: async (nodeId, folderId, targetIndex) => {
+            try {
+                const node = findNodeById(nodeId);
+                if (!node) {
+                    return { success: false, error: "Node not found" };
+                }
+
+
+
+                // For real folders, we need to move the node in Adobe Express
+                if (folderId) {
+                    const folder = findNodeById(folderId);
+                    if (!folder) {
+                        return { success: false, error: "Folder not found" };
+                    }
+
+                    await runEdit("Move To Folder", () => {
+                        // Remove from current parent
+                        if (node.parent && typeof node.removeFromParent === "function") {
+                            node.removeFromParent();
+                        }
+                        
+                        // Add to folder
+                        if (folder.children && typeof folder.children.append === "function") {
+                            folder.children.append(node);
+                        }
+                    });
+                    
+                    return { success: true };
+                }
+
+                // Moving out of folder (to root)
+                await runEdit("Move Out Of Folder", () => {
+                    const rootParent = editor.documentRoot;
+                    if (rootParent && rootParent.children) {
+                        // Remove from current parent
+                        if (node.parent && typeof node.removeFromParent === "function") {
+                            node.removeFromParent();
+                        }
+                        
+                        // Add to root
+                        rootParent.children.append(node);
+                    }
+                });
+                
+                return { success: true };
+            } catch (err) {
+                return { success: false, error: err.message };
+            }
+        },
+
+        // NEW: Move layer to specific position (direct positioning)
+        moveToPosition: async (nodeId, parentId, targetIndex, orderedNodeIds) => {
+            try {
+                const node = findNodeById(nodeId);
+                if (!node) {
+                    return { success: false, error: "Node not found" };
+                }
+
+                const parent = node.parent;
+                if (!parent || !parent.children) {
+                    return { success: false, error: "No parent container" };
+                }
+
+                await runEdit("Move To Position", () => {
+                    // Adobe Express only supports: remove, append, prepend
+                    // We'll reconstruct the entire order using these basic operations
+                    
+                    const currentChildren = Array.from(parent.children);
+                    
+                    // Step 1: Remove all nodes except the first one (keep it as anchor)
+                    const nodesToReorder = [];
+                    const idToNode = new Map(currentChildren.map(c => [c.id, c]));
+                    
+                    // Use the orderedNodeIds directly - no need to reverse
+                    // Adobe Express internal order: 0 = top (first in list)
+                    const orderedNodeIdsToUse = [...orderedNodeIds];
+                    
+                    // Collect all nodes that need to be repositioned according to orderedNodeIds
+                    for (const nodeId of orderedNodeIdsToUse) {
+                        const nodeToMove = idToNode.get(nodeId);
+                        if (nodeToMove) {
+                            nodesToReorder.push(nodeToMove);
+                        }
+                    }
+                    
+                    if (nodesToReorder.length === 0) {
+                        return;
+                    }
+                    
+                    // Step 2: Remove all nodes from parent (except we'll keep track of them)
+                    const removedNodes = [];
+                    for (const nodeToMove of nodesToReorder) {
+                        if (typeof nodeToMove.removeFromParent === "function") {
+                            nodeToMove.removeFromParent();
+                            removedNodes.push(nodeToMove);
+                        }
+                    }
+                    
+                    // Step 3: Add them back in the correct order
+                    // First node goes to the front (prepend), others append in order
+                    for (let i = 0; i < removedNodes.length; i++) {
+                        const nodeToAdd = removedNodes[i];
+                        
+                        if (i === 0) {
+                            // First node - try prepend to put it at the beginning
+                            if (typeof parent.children.prepend === "function") {
+                                parent.children.prepend(nodeToAdd);
+                            } else {
+                                parent.children.append(nodeToAdd);
+                            }
+                        } else {
+                            // Subsequent nodes - append them
+                            parent.children.append(nodeToAdd);
+                        }
+                    }
+                });
+
+                return { success: true };
+            } catch (err) {
+                return { success: false, error: err.message };
+            }
+        },
+
+        // Export selected layers as images
+        exportFrames: async (selectedNodeIds) => {
+            try {
+                const exportedImages = [];
+                
+                // Try different methods to export nodes
+                for (const nodeId of selectedNodeIds) {
+                    try {
+                        // Method 1: Try to get it from the current selection
+                        let node = null;
+                        if (editor.selection && editor.selection.items) {
+                            node = editor.selection.items.find(item => item.id === nodeId);
+                        }
+                        
+                        // Method 2: If node not found and it's the insertion parent
+                        if (!node && editor.context && editor.context.insertionParent && 
+                            editor.context.insertionParent.id === nodeId) {
+                            node = editor.context.insertionParent;
+                        }
+                        
+                        // Method 3: If it's a dummy ID, use the document root
+                        if (!node && (nodeId === "dummy-id" || nodeId === "document")) {
+                            node = editor.documentRoot;
+                        }
+                        
+                        // Method 4: If it's the temporary rectangle we created
+                        if (!node && nodeId === "temp-rect") {
+                            // Create a new rectangle for exporting
+                            const tempRect = editor.createRectangle();
+                            if (tempRect) {
+                                // Define rectangle dimensions
+                                tempRect.width = 240;
+                                tempRect.height = 180;
+                                
+                                // Define rectangle position
+                                tempRect.translation = { x: 10, y: 10 };
+                                
+                                // Define rectangle color
+                                const color = { red: 0.32, green: 0.34, blue: 0.89, alpha: 1 };
+                                const rectangleFill = editor.makeColorFill(color);
+                                tempRect.fill = rectangleFill;
+                                
+                                node = tempRect;
+                            }
+                        }
+                        
+                        if (node) {
+                            try {
+                                // Try to export as PNG
+                                const pngBlob = await node.exportPNG();
+                                
+                                // Convert blob to base64 data URL
+                                const base64Data = await new Promise((resolve) => {
+                                    const reader = new FileReader();
+                                    reader.onloadend = () => resolve(reader.result);
+                                    reader.readAsDataURL(pngBlob);
+                                });
+                                
+                                exportedImages.push({
+                                    id: nodeId,
+                                    name: node.name || `Layer`,
+                                    type: node.type,
+                                    imageData: base64Data
+                                });
+                                
+                                // Clean up if it's a temporary rectangle we created for export
+                                if (nodeId === "temp-rect") {
+                                    try {
+                                        node.remove();
+                                    } catch (err) {
+                                        // Silent cleanup error
+                                    }
+                                }
+                            } catch (exportErr) {
+                                // Silent export error
+                            }
+                        }
+                    } catch (err) {
+                        // Silent processing error
+                    }
+                }
+                
+                // If no images were exported, create a dummy image
+                if (exportedImages.length === 0) {
+                    try {
+                        // Create a rectangle for exporting
+                        const dummyRect = editor.createRectangle();
+                        if (dummyRect) {
+                            // Define rectangle dimensions
+                            dummyRect.width = 240;
+                            dummyRect.height = 180;
+                            
+                            // Define rectangle position
+                            dummyRect.translation = { x: 10, y: 10 };
+                            
+                            // Define rectangle color
+                            const color = { red: 0.32, green: 0.34, blue: 0.89, alpha: 1 };
+                            const rectangleFill = editor.makeColorFill(color);
+                            dummyRect.fill = rectangleFill;
+                            
+                            // Export the rectangle
+                            const pngBlob = await dummyRect.exportPNG();
+                            
+                            // Convert blob to base64 data URL
+                            const base64Data = await new Promise((resolve) => {
+                                const reader = new FileReader();
+                                reader.onloadend = () => resolve(reader.result);
+                                reader.readAsDataURL(pngBlob);
+                            });
+                            
+                            exportedImages.push({
+                                id: "dummy-image",
+                                name: "Sample Image",
+                                type: "rectangle",
+                                imageData: base64Data
+                            });
+                            
+                            // Clean up
+                            try {
+                                dummyRect.remove();
+                            } catch (err) {
+                                // Silent cleanup error
+                            }
+                        }
+                    } catch (err) {
+                        // Silent dummy image creation error
+                    }
+                }
+                
+                return { success: true, images: exportedImages };
+            } catch (error) {
+                return { 
+                    success: false, 
+                    error: error.message,
+                    stack: error.stack
+                };
+            }
+        },
+        
+        // Get document structure info
+        getDocumentInfo: async () => {
+            try {
+                // Default info
+                const info = {
+                    name: "Adobe Express Document",
+                    type: "document"
+                };
+                
+                // Try to get document info
+                try {
+                    const document = editor.documentRoot;
+                    if (document) {
+                        info.name = document.name || "Untitled Document";
+                        info.id = document.id;
+                        info.type = document.type;
+                    }
+                } catch (err) {
+                    // Silent error
+                }
+                
+                // Try to get selection info
+                try {
+                    if (editor.selection && editor.selection.items && editor.selection.items.length > 0) {
+                        info.selectionCount = editor.selection.items.length;
+                    }
+                } catch (err) {
+                    // Silent error
+                }
+                
+                return { success: true, info };
+            } catch (error) {
+                return { 
+                    success: false, 
+                    error: error.message,
+                    stack: error.stack
+                };
+            }
+        },
+        
+        // NEW: Generate thumbnail for a specific node
+        generateThumbnail: async (nodeId, size = 64) => {
+            try {
+                const node = findNodeById(nodeId);
+                if (!node) {
+                    return { success: false, error: "Node not found", nodeId };
+                }
+
+                // Ensure the node supports exportPNG
+                if (typeof node.exportPNG !== "function") {
+                    return { success: false, error: "exportPNG not supported", nodeId };
+                }
+
+                // Try exporting PNG – some SDK versions accept options object, others do not
+                let pngBlob = null;
+                try {
+                    pngBlob = await node.exportPNG({ width: size });
+                } catch (err) {
+                    // Fallback: try without options
+                    pngBlob = await node.exportPNG();
+                }
+
+                if (!pngBlob) {
+                    return { success: false, error: "Failed to export PNG", nodeId };
+                }
+
+                // Convert Blob to Base64 data URL so it can be transferred to the UI easily
+                const dataUrl = await new Promise((resolve) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.readAsDataURL(pngBlob);
+                });
+
+                return { success: true, thumbnail: dataUrl, nodeId };
+            } catch (err) {
+                return { success: false, error: err.message || "Unknown error", nodeId };
+            }
+        },
+        
+        // NEW: Sync selection from extension to Adobe Express
+        syncSelectionToAdobe: async (selectedNodeIds) => {
+            try {
+                if (!editor.selection) {
+                    return { success: false, error: 'Editor selection not available' };
+                }
+
+                // Clear current selection
+                editor.selection.clear();
+
+                // Add each selected node to the selection
+                for (const nodeId of selectedNodeIds) {
+                    const node = findNodeById(nodeId);
+                    if (node) {
+                        try {
+                            editor.selection.add(node);
+                        } catch (err) {
+                            // Silent error
+                        }
+                    }
+                }
+
+                // NEW: Try alternative selection setting methods
+                if (selectedNodeIds.length > 0) {
+                    // Method 1: Try to set selection via node properties
+                    try {
+                        const nodes = selectedNodeIds.map(id => findNodeById(id)).filter(Boolean);
+                        for (const node of nodes) {
+                            // Try setting selection-related properties directly
+                            if (node.selected !== undefined) {
+                                node.selected = true;
+                            }
+                            if (node.isSelected !== undefined) {
+                                node.isSelected = true;
+                            }
+                            if (node.selectionState !== undefined) {
+                                node.selectionState = 'selected';
+                            }
+                        }
+                    } catch (err) {
+                        // Silent error
+                    }
+                    
+                    // Method 2: Try to use editor.select() if available
+                    try {
+                        if (typeof editor.select === 'function') {
+                            const nodes = selectedNodeIds.map(id => findNodeById(id)).filter(Boolean);
+                            editor.select(nodes);
+                        }
+                    } catch (err) {
+                        // Silent error
+                    }
+                    
+                    // Method 3: Try to use editor.selection.select() if available
+                    try {
+                        if (editor.selection && typeof editor.selection.select === 'function') {
+                            const nodes = selectedNodeIds.map(id => findNodeById(id)).filter(Boolean);
+                            editor.selection.select(nodes);
+                        }
+                    } catch (err) {
+                        // Silent error
+                    }
+                }
+
+                return { success: true };
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        },
+
+        // NEW: Try alternative selection detection method
+        getCurrentSelectionAlternative: async () => {
+            try {
+                const selectedIds = new Set();
+                
+                // Method 1: Try to use selectAll to see what's selectable
+                if (editor.selection && typeof editor.selection.selectAll === 'function') {
+                    try {
+                        // Save current selection
+                        const originalSelection = editor.selection.items ? [...editor.selection.items] : [];
+                        
+                        // Select all to see what's available
+                        editor.selection.selectAll();
+                        
+                        // Get all selectable items
+                        if (editor.selection.items && editor.selection.items.length > 0) {
+                            // Now try to detect which ones are actually selected
+                            // This is a workaround - we'll try to clear selection and see what remains
+                            for (const item of editor.selection.items) {
+                                try {
+                                    // Try to remove this item from selection
+                                    const beforeCount = editor.selection.items.length;
+                                    editor.selection.remove(item);
+                                    const afterCount = editor.selection.items.length;
+                                    
+                                    // If the count decreased, this item was actually selected
+                                    if (afterCount < beforeCount) {
+                                        selectedIds.add(item.id);
+                                    }
+                                    
+                                    // Add it back to selection
+                                    editor.selection.add(item);
+                                } catch (err) {
+                                    // Silent error
+                                }
+                            }
+                        }
+                        
+                        // Restore original selection
+                        editor.selection.clear();
+                        if (originalSelection.length > 0) {
+                            for (const item of originalSelection) {
+                                try {
+                                    editor.selection.add(item);
+                                } catch (err) {
+                                    // Silent error
+                                }
+                            }
+                        }
+                    } catch (err) {
+                        // Silent error
+                    }
+                }
+                
+                // Method 2: Try to use editor.selection.items directly
+                if (selectedIds.size === 0) {
+                    try {
+                        if (editor.selection && editor.selection.items && editor.selection.items.length > 0) {
+                            editor.selection.items.forEach(item => {
+                                selectedIds.add(item.id);
+                            });
+                        }
+                    } catch (err) {
+                        // Silent error
+                    }
+                }
+                
+                // Method 3: Try to use editor.selection.selectedItems (alternative property)
+                if (selectedIds.size === 0) {
+                    try {
+                        if (editor.selection && editor.selection.selectedItems && editor.selection.selectedItems.length > 0) {
+                            editor.selection.selectedItems.forEach(item => {
+                                selectedIds.add(item.id);
+                            });
+                        }
+                    } catch (err) {
+                        // Silent error
+                    }
+                }
+                
+                // Method 4: Try to use editor.selection.getSelectedItems() method
+                if (selectedIds.size === 0) {
+                    try {
+                        if (editor.selection && typeof editor.selection.getSelectedItems === 'function') {
+                            const items = editor.selection.getSelectedItems();
+                            if (items && items.length > 0) {
+                                items.forEach(item => {
+                                    selectedIds.add(item.id);
+                                });
+                            }
+                        }
+                    } catch (err) {
+                        // Silent error
+                    }
+                }
+                
+                // Method 5: Try to use editor.getSelectedItems() (top-level method)
+                if (selectedIds.size === 0) {
+                    try {
+                        if (typeof editor.getSelectedItems === 'function') {
+                            const items = editor.getSelectedItems();
+                            if (items && items.length > 0) {
+                                items.forEach(item => {
+                                    selectedIds.add(item.id);
+                                });
+                            }
+                        }
+                    } catch (err) {
+                        // Silent error
+                    }
+                }
+                
+                return { success: true, selectedIds: Array.from(selectedIds) };
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        },
+
+        // NEW: Debug function to get detailed info about selected node
+        getSelectedNodeInfo: async () => {
+            try {
+                if (!editor.selection || !editor.selection.items || editor.selection.items.length === 0) {
+                    return { success: false, error: "No selection" };
+                }
+                
+                const selectedNode = editor.selection.items[0];
+                const info = {
+                    id: selectedNode.id,
+                    type: selectedNode.type,
+                    name: selectedNode.name,
+                    editorName: selectedNode.editorName,
+                    childrenCount: selectedNode.children ? selectedNode.children.length : 0,
+                    hasChildren: !!selectedNode.children,
+                    properties: {}
+                };
+                
+                // Try to get additional properties
+                try {
+                    if (selectedNode.children && typeof selectedNode.children[Symbol.iterator] === "function") {
+                        // Don't try to access children for tables
+                        if (selectedNode.editorName !== "tables" && selectedNode.type !== "table") {
+                            const firstFewChildren = [];
+                            let count = 0;
+                            for (const child of selectedNode.children) {
+                                if (count >= 3) break;
+                                firstFewChildren.push({
+                                    id: child.id,
+                                    type: child.type,
+                                    name: child.name,
+                                    editorName: child.editorName
+                                });
+                                count++;
+                            }
+                            info.firstFewChildren = firstFewChildren;
+                        } else {
+                            info.firstFewChildren = "Table - children not accessible";
+                        }
+                    }
+                } catch (childrenError) {
+                    info.childrenError = childrenError.message;
+                }
+                
+                // Try to get all available properties
+                try {
+                    const allProps = Object.getOwnPropertyNames(selectedNode);
+                    info.availableProperties = allProps.slice(0, 20); // First 20 properties
+                } catch (propsError) {
+                    info.propertiesError = propsError.message;
+                }
+                
+                return { success: true, nodeInfo: info };
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        },
+
+        // Legacy function - keep for compatibility
+        createRectangle: () => {
+            const rectangle = editor.createRectangle();
+
+            // Define rectangle dimensions.
+            rectangle.width = 240;
+            rectangle.height = 180;
+
+            // Define rectangle position.
+            rectangle.translation = { x: 10, y: 10 };
+
+            // Define rectangle color.
+            const color = { red: 0.32, green: 0.34, blue: 0.89, alpha: 1 };
+
+            // Fill the rectangle with the color.
+            const rectangleFill = editor.makeColorFill(color);
+            rectangle.fill = rectangleFill;
+
+            // Add the rectangle to the document.
+            const insertionParent = editor.context.insertionParent;
+            insertionParent.children.append(rectangle);
+        }
+    };
+
+    // Expose `sandboxApi` to the UI runtime.
+    runtime.exposeApi(sandboxApi);
+}
+
+start();
